@@ -1349,6 +1349,56 @@ pub fn verify_and_unarchive_snapshots(
     ))
 }
 
+pub fn verify_and_unarchive_full_snapshot_only(
+    bank_snapshots_dir: impl AsRef<Path>,
+    full_snapshot_archive_info: &FullSnapshotArchiveInfo,
+    account_paths: &[PathBuf],
+    next_append_vec_id: Arc<AtomicAppendVecId>,
+) -> Result<UnarchivedSnapshot> {
+    let parallel_divisions = (num_cpus::get() / 4).clamp(1, PARALLEL_UNTAR_READERS_DEFAULT);
+
+    let unarchived_full_snapshot = unarchive_snapshot(
+        &bank_snapshots_dir,
+        TMP_SNAPSHOT_ARCHIVE_PREFIX,
+        full_snapshot_archive_info.path(),
+        "snapshot untar",
+        account_paths,
+        full_snapshot_archive_info.archive_format(),
+        parallel_divisions,
+        next_append_vec_id.clone(),
+    )?;
+
+    Ok(unarchived_full_snapshot)
+}
+
+pub fn verify_and_unarchive_incremental_snapshot_only(
+    bank_snapshots_dir: impl AsRef<Path>,
+    incremental_snapshot_archive_info: Option<&IncrementalSnapshotArchiveInfo>,
+    account_paths: &[PathBuf],
+    next_append_vec_id: Arc<AtomicAppendVecId>,
+) -> Result<Option<UnarchivedSnapshot>> {
+    let parallel_divisions = (num_cpus::get() / 4).clamp(1, PARALLEL_UNTAR_READERS_DEFAULT);
+
+    let unarchived_incremental_snapshot =
+        if let Some(incremental_snapshot_archive_info) = incremental_snapshot_archive_info {
+            let unarchived_incremental_snapshot = unarchive_snapshot(
+                &bank_snapshots_dir,
+                TMP_SNAPSHOT_ARCHIVE_PREFIX,
+                incremental_snapshot_archive_info.path(),
+                "incremental snapshot untar",
+                account_paths,
+                incremental_snapshot_archive_info.archive_format(),
+                parallel_divisions,
+                next_append_vec_id.clone(),
+            )?;
+            Some(unarchived_incremental_snapshot)
+        } else {
+            None
+        };
+
+    Ok(unarchived_incremental_snapshot)
+}
+
 /// Spawns a thread for unpacking a snapshot
 fn spawn_unpack_snapshot_thread(
     file_sender: Sender<PathBuf>,
