@@ -18,10 +18,11 @@ use {
             get_highest_full_snapshot_archive_info, get_highest_incremental_snapshot_archive_info,
             get_snapshot_file_name, get_storages_to_serialize, hard_link_storages_to_snapshot,
             rebuild_storages_from_snapshot_dir, serialize_snapshot_data_file,
-            verify_and_unarchive_snapshots, verify_unpacked_snapshots_dir_and_version,
-            AddBankSnapshotError, ArchiveFormat, BankSnapshotInfo, BankSnapshotType, SnapshotError,
-            SnapshotRootPaths, SnapshotVersion, StorageAndNextAppendVecId,
-            UnpackedSnapshotsDirAndVersion, VerifySlotDeltasError,
+            verify_and_unarchive_full_snapshot_only,
+            verify_and_unarchive_incremental_snapshot_only, verify_and_unarchive_snapshots,
+            verify_unpacked_snapshots_dir_and_version, AddBankSnapshotError, ArchiveFormat,
+            BankSnapshotInfo, BankSnapshotType, SnapshotError, SnapshotRootPaths, SnapshotVersion,
+            StorageAndNextAppendVecId, UnpackedSnapshotsDirAndVersion, VerifySlotDeltasError,
         },
         status_cache,
     },
@@ -259,6 +260,125 @@ pub fn bank_fields_from_snapshot_archives(
     )
 }
 
+fn make_download_request(
+    client: &reqwest::blocking::Client,
+    ip: &str,
+    path: &str,
+    download_dir: &Path,
+) {
+    let url = format!("http://{}{}", ip, path);
+    info!("downlaoding latest incremental snapshot {:?}", url);
+    let response = client.get(&url).send().unwrap();
+
+    if response.status().is_success() {
+        let filename = Path::new(path).file_name().unwrap().to_str().unwrap();
+        let mut dest_path = PathBuf::from(download_dir);
+        dest_path.push(filename);
+        let mut dest = fs::File::create(dest_path.clone()).unwrap();
+        std::io::copy(&mut response.bytes().unwrap().as_ref(), &mut dest).unwrap();
+        info!(
+            "downloaded latest incremental snapshot: {}",
+            dest_path.clone().display()
+        );
+    } else {
+        info!(
+            "failed to download latest incremental snapshot: {}",
+            response.status()
+        );
+    }
+}
+
+fn parse_path(path: &str) -> Option<(u64, u64, String)> {
+    let re =
+        regex::Regex::new(r"/incremental-snapshot-(\d+)-(\d+)-([0-9A-Za-z]+)\.tar\.zst").unwrap();
+    if let Some(captures) = re.captures(path) {
+        if let (Some(root_slot), Some(incre_slot), Some(incre_hash)) =
+            (captures.get(1), captures.get(2), captures.get(3))
+        {
+            let root_slot = root_slot.as_str().parse::<u64>().ok()?;
+            let incre_slot = incre_slot.as_str().parse::<u64>().ok()?;
+            let incre_hash = incre_hash.as_str().to_string();
+            return Some((root_slot, incre_slot, incre_hash));
+        }
+    }
+    None
+}
+
+fn check_for_latest_incremental_snapshot(
+    full_snapshot_archive_info: &FullSnapshotArchiveInfo,
+    incremental_snapshot_archive_info: Option<&IncrementalSnapshotArchiveInfo>,
+) -> Option<IncrementalSnapshotArchiveInfo> {
+    if incremental_snapshot_archive_info.is_none() {
+        return None;
+    }
+
+    let incremental_snapshot_archive_info = incremental_snapshot_archive_info.unwrap();
+
+    let ip = match std::env::var("RPC_SERVER_ADDRESS") {
+        Ok(val) => val,
+        Err(_) => {
+            warn!("environment variable RPC_SERVER_ADDRESS not set");
+            return Some(incremental_snapshot_archive_info.clone());
+        }
+    };
+
+    let socket_addr = match ip.parse::<std::net::SocketAddr>() {
+        Ok(addr) => addr,
+        Err(_) => {
+            warn!("invalid IP address and port: {}", ip);
+            return Some(incremental_snapshot_archive_info.clone());
+        }
+    };
+
+    let url = format!("http://{}/incremental-snapshot.tar.bz2", socket_addr);
+    let client = reqwest::blocking::Client::new();
+    let response = match client
+        .head(&url)
+        .header("Content-Type", "application/json")
+        .send()
+    {
+        Ok(resp) => resp,
+        Err(err) => {
+            info!("Failed to send request: {}", err);
+            return Some(incremental_snapshot_archive_info.clone());
+        }
+    };
+
+    let path = response.url().path();
+    if let Some((root_slot, incre_slot, _incre_hash)) = parse_path(path) {
+        if full_snapshot_archive_info.slot() == root_slot
+            && incremental_snapshot_archive_info.slot() < incre_slot
+        {
+            info!("latest incremental snapshot available | downloading");
+            let current_incremental_archive_file_path = incremental_snapshot_archive_info
+                .snapshot_archive_info()
+                .path
+                .to_str()
+                .unwrap();
+            let current_incremental_archive_dir_path = &current_incremental_archive_file_path
+                [..current_incremental_archive_file_path.rfind('/').unwrap()]
+                .to_string();
+            let incremental_snapshot_archives_dir = Path::new(current_incremental_archive_dir_path);
+            make_download_request(&client, &ip, path, incremental_snapshot_archives_dir);
+
+            if let Some(new_incremental_snapshot_info) =
+                snapshot_utils::get_highest_incremental_snapshot_archive_info(
+                    incremental_snapshot_archives_dir,
+                    full_snapshot_archive_info.slot(),
+                )
+            {
+                return Some(new_incremental_snapshot_info);
+            }
+        } else {
+            info!("no latest incremental snapshot available");
+        }
+    } else {
+        info!("failed to parse path snapshot download path");
+    }
+
+    Some(incremental_snapshot_archive_info.clone())
+}
+
 /// Rebuild bank from snapshot archives.  Handles either just a full snapshot, or both a full
 /// snapshot and an incremental snapshot.
 #[allow(clippy::too_many_arguments)]
@@ -294,13 +414,33 @@ pub fn bank_from_snapshot_archives(
             )
     );
 
-    let (unarchived_full_snapshot, mut unarchived_incremental_snapshot, next_append_vec_id) =
-        verify_and_unarchive_snapshots(
-            bank_snapshots_dir,
-            full_snapshot_archive_info,
-            incremental_snapshot_archive_info,
-            account_paths,
-        )?;
+    let next_append_vec_id = Arc::new(AtomicAppendVecId::new(0));
+    let unarchived_full_snapshot = verify_and_unarchive_full_snapshot_only(
+        &bank_snapshots_dir,
+        full_snapshot_archive_info,
+        account_paths,
+        next_append_vec_id.clone(),
+    )?;
+
+    let incremental_snapshot_archive_info = check_for_latest_incremental_snapshot(
+        full_snapshot_archive_info,
+        incremental_snapshot_archive_info,
+    );
+
+    let mut unarchived_incremental_snapshot = verify_and_unarchive_incremental_snapshot_only(
+        &bank_snapshots_dir,
+        incremental_snapshot_archive_info.as_ref(),
+        account_paths,
+        next_append_vec_id.clone(),
+    )?;
+
+    // let (unarchived_full_snapshot, mut unarchived_incremental_snapshot, next_append_vec_id) =
+    //     verify_and_unarchive_snapshots(
+    //         bank_snapshots_dir,
+    //         full_snapshot_archive_info,
+    //         None,
+    //         account_paths,
+    //     )?;
 
     let mut storage = unarchived_full_snapshot.storage;
     if let Some(ref mut unarchive_preparation_result) = unarchived_incremental_snapshot {
@@ -311,7 +451,7 @@ pub fn bank_from_snapshot_archives(
 
     let storage_and_next_append_vec_id = StorageAndNextAppendVecId {
         storage,
-        next_append_vec_id,
+        next_append_vec_id: Arc::try_unwrap(next_append_vec_id).unwrap(),
     };
 
     let mut measure_rebuild = Measure::start("rebuild bank from snapshots");
@@ -339,19 +479,19 @@ pub fn bank_from_snapshot_archives(
     measure_rebuild.stop();
     info!("{}", measure_rebuild);
 
-    let snapshot_archive_info = incremental_snapshot_archive_info.map_or_else(
-        || full_snapshot_archive_info.snapshot_archive_info(),
-        |incremental_snapshot_archive_info| {
-            incremental_snapshot_archive_info.snapshot_archive_info()
-        },
-    );
+    let snapshot_archive_info = if let Some(ref archive_info) = incremental_snapshot_archive_info {
+        archive_info.snapshot_archive_info()
+    } else {
+        full_snapshot_archive_info.snapshot_archive_info()
+    };
+
     verify_bank_against_expected_slot_hash(
         &bank,
         snapshot_archive_info.slot,
         snapshot_archive_info.hash,
     )?;
 
-    let base = (incremental_snapshot_archive_info.is_some()
+    let base = (incremental_snapshot_archive_info.clone().is_some()
         && bank
             .feature_set
             .is_active(&feature_set::incremental_snapshot_only_incremental_hash_calculation::id()))
