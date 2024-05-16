@@ -258,6 +258,8 @@ mod tests {
             incremental_snapshot_stream: None,
         };
         let mut dbank = crate::serde_snapshot::bank_from_streams(
+            None,
+            None,
             serde_style,
             &mut snapshot_streams,
             &dbank_paths,
@@ -387,6 +389,8 @@ mod tests {
             let storage_and_next_append_vec_id =
                 copy_append_vecs(&bank.rc.accounts.accounts_db, copied_accounts.path()).unwrap();
             let dbank = crate::serde_snapshot::bank_from_streams(
+                None,
+                None,
                 SerdeStyle::Newer,
                 &mut snapshot_streams,
                 &dbank_paths,
@@ -571,6 +575,8 @@ mod tests {
         let storage_and_next_append_vec_id =
             copy_append_vecs(&bank.rc.accounts.accounts_db, copied_accounts.path()).unwrap();
         let dbank = crate::serde_snapshot::bank_from_streams(
+            None,
+            None,
             SerdeStyle::Newer,
             &mut snapshot_streams,
             &dbank_paths,

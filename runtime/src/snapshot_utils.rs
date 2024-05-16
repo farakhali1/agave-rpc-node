@@ -1135,7 +1135,7 @@ fn deserialize_snapshot_data_files_capped<T: Sized>(
 
 /// Before running the deserializer function, perform common operations on the snapshot archive
 /// files, such as checking the file size and opening the file into a stream.
-fn create_snapshot_data_file_stream(
+pub fn create_snapshot_data_file_stream(
     snapshot_root_file_path: impl AsRef<Path>,
     maximum_file_size: u64,
 ) -> Result<(u64, BufReader<std::fs::File>)> {

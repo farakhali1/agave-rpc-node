@@ -5,6 +5,10 @@ use {
         epoch_stakes::EpochStakes,
         runtime_config::RuntimeConfig,
         serde_snapshot::storage::SerializableAccountStorageEntry,
+        snapshot_archive_info::{
+            FullSnapshotArchiveInfo, IncrementalSnapshotArchiveInfo, SnapshotArchiveInfoGetter,
+        },
+        snapshot_bank_utils::check_for_latest_incremental_snapshot,
         snapshot_utils::{
             self, SnapshotError, StorageAndNextAppendVecId, BANK_SNAPSHOT_PRE_FILENAME_EXTENSION,
         },
@@ -350,10 +354,13 @@ pub(crate) fn fields_from_streams(
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn bank_from_streams<R>(
+    full_snapshot_archive_info: Option<&FullSnapshotArchiveInfo>,
+    incremental_snapshot_archive_info: Option<&IncrementalSnapshotArchiveInfo>,
+    bank_snapshots_dir: impl AsRef<Path>,
     serde_style: SerdeStyle,
     snapshot_streams: &mut SnapshotStreams<R>,
     account_paths: &[PathBuf],
-    storage_and_next_append_vec_id: StorageAndNextAppendVecId,
+    storage_and_next_append_vec_id: &mut StorageAndNextAppendVecId,
     genesis_config: &GenesisConfig,
     runtime_config: &RuntimeConfig,
     debug_keys: Option<Arc<HashSet<Pubkey>>>,
@@ -371,6 +378,9 @@ where
 {
     let (bank_fields, accounts_db_fields) = fields_from_streams(serde_style, snapshot_streams)?;
     reconstruct_bank_from_fields(
+        full_snapshot_archive_info,
+        incremental_snapshot_archive_info,
+        bank_snapshots_dir,
         bank_fields,
         accounts_db_fields,
         genesis_config,
@@ -577,12 +587,15 @@ impl<'a, C> solana_frozen_abi::abi_example::IgnoreAsHelper for SerializableAccou
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_bank_from_fields<E>(
+    full_snapshot_archive_info: Option<&FullSnapshotArchiveInfo>,
+    incremental_snapshot_archive_info: Option<&IncrementalSnapshotArchiveInfo>,
+    bank_snapshots_dir: impl AsRef<Path>,
     bank_fields: SnapshotBankFields,
     snapshot_accounts_db_fields: SnapshotAccountsDbFields<E>,
     genesis_config: &GenesisConfig,
     runtime_config: &RuntimeConfig,
     account_paths: &[PathBuf],
-    storage_and_next_append_vec_id: StorageAndNextAppendVecId,
+    storage_and_next_append_vec_id: &mut StorageAndNextAppendVecId,
     debug_keys: Option<Arc<HashSet<Pubkey>>>,
     additional_builtins: Option<&[BuiltinPrototype]>,
     account_secondary_indexes: AccountSecondaryIndexes,
@@ -605,6 +618,9 @@ where
     );
     let bank_fields = bank_fields.collapse_into();
     let (accounts_db, reconstructed_accounts_db_info) = reconstruct_accountsdb_from_fields(
+        full_snapshot_archive_info,
+        incremental_snapshot_archive_info,
+        bank_snapshots_dir,
         snapshot_accounts_db_fields,
         account_paths,
         storage_and_next_append_vec_id,
@@ -728,9 +744,12 @@ struct ReconstructedAccountsDbInfo {
 
 #[allow(clippy::too_many_arguments)]
 fn reconstruct_accountsdb_from_fields<E>(
+    full_snapshot_archive_info: Option<&FullSnapshotArchiveInfo>,
+    incremental_snapshot_archive_info: Option<&IncrementalSnapshotArchiveInfo>,
+    bank_snapshots_dir: impl AsRef<Path>,
     snapshot_accounts_db_fields: SnapshotAccountsDbFields<E>,
     account_paths: &[PathBuf],
-    storage_and_next_append_vec_id: StorageAndNextAppendVecId,
+    storage_and_next_append_vec_id: &mut StorageAndNextAppendVecId,
     genesis_config: &GenesisConfig,
     account_secondary_indexes: AccountSecondaryIndexes,
     limit_load_slot_count_from_snapshot: Option<usize>,
@@ -909,7 +928,7 @@ where
         old_stats.is_none(),
         "There should not already be a BankHashStats at slot {snapshot_slot}: {old_stats:?}",
     );
-    accounts_db.storage.initialize(storage);
+    accounts_db.storage.initialize((storage.clone()).into());
     accounts_db
         .next_id
         .store(next_append_vec_id, Ordering::Release);
@@ -967,6 +986,20 @@ where
         &storage_info,
         &rent_paying_accounts_by_partition,
     );
+
+    let incremental_snapshot_archive_info = check_for_latest_incremental_snapshot(
+        full_snapshot_archive_info,
+        incremental_snapshot_archive_info,
+    );
+    let next_append_vec_id_new = Arc::new(AtomicAppendVecId::new(0));
+    let unarchived_incremental_snapshot =
+        crate::snapshot_utils::verify_and_unarchive_incremental_snapshot_only(
+            &bank_snapshots_dir,
+            incremental_snapshot_archive_info.as_ref(),
+            account_paths,
+            next_append_vec_id_new,
+        )
+        .unwrap();
 
     let accounts_data_len = accounts_db.generate_index_step2(
         &mut total_time,
