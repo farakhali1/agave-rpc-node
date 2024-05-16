@@ -630,13 +630,13 @@ struct GenerateIndexTimings {
 }
 
 #[derive(Default, Debug, PartialEq, Eq)]
-struct StorageSizeAndCount {
+pub struct StorageSizeAndCount {
     /// total size stored, including both alive and dead bytes
     pub stored_size: usize,
     /// number of accounts in the storage including both alive and dead accounts
     pub count: usize,
 }
-type StorageSizeAndCountMap = DashMap<AppendVecId, StorageSizeAndCount>;
+pub type StorageSizeAndCountMap = DashMap<AppendVecId, StorageSizeAndCount>;
 
 impl GenerateIndexTimings {
     pub fn report(&self, startup_stats: &StartupStats) {
@@ -8972,6 +8972,316 @@ impl AccountsDb {
             amount_to_top_off_rent,
             rent_paying_accounts_by_partition,
         }
+    }
+
+    pub fn generate_index_step1(
+        &self,
+        limit_load_slot_count_from_snapshot: Option<usize>,
+        verify: bool,
+        rent_paying: Arc<AtomicUsize>,
+        insertion_time_us: Arc<AtomicU64>,
+        amount_to_top_off_rent: Arc<AtomicU64>,
+        total_including_duplicates: Arc<AtomicU64>,
+        accounts_data_len: Arc<AtomicU64>,
+        rent_collector: &RentCollector,
+        storage_info: &StorageSizeAndCountMap,
+        rent_paying_accounts_by_partition: &Mutex<RentPayingAccountsByPartition>,
+    ) -> (u64, u64) {
+        let mut slots = self.storage.all_slots();
+        slots.sort_unstable();
+        info!("Slots len: {:?}", slots.len());
+        // info!("Slots: {:?}", slots);
+        info!("slots first {:?}", slots.first());
+        info!("slots last {:?}", slots.last());
+        if let Some(limit) = limit_load_slot_count_from_snapshot {
+            slots.truncate(limit); // get rid of the newer slots and keep just the older
+        }
+
+        let pass = 0;
+        if pass == 0 {
+            self.accounts_index
+                .set_startup(Startup::StartupWithExtraThreads);
+        }
+
+        let total_processed_slots_across_all_threads = AtomicU64::new(0);
+        let outer_slots_len = slots.len();
+        let threads = if self.accounts_index.is_disk_index_enabled() {
+            // these write directly to disk, so the more threads, the better
+            num_cpus::get()
+        } else {
+            // seems to be a good hueristic given varying # cpus for in-mem disk index
+            8
+        };
+        let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
+        let mut index_time = Measure::start("index");
+        info!("threads {:?}, chunks {:?}", threads, chunk_size);
+
+        let scan_time: u64 = slots
+            .par_chunks(chunk_size)
+            .map(|slots| {
+                let mut log_status = MultiThreadProgress::new(
+                    &total_processed_slots_across_all_threads,
+                    2,
+                    outer_slots_len as u64,
+                );
+                let mut scan_time_sum = 0;
+                info!("slots - > {:?}", slots);
+                info!("chunk_size - > {:?}", chunk_size);
+                for (index, slot) in slots.iter().enumerate() {
+                    info!("index {:?}, slot {:?}", index, slot);
+                    let mut scan_time = Measure::start("scan");
+                    log_status.report(index as u64);
+                    let Some(storage) = self.storage.get_slot_storage_entry(*slot) else {
+                        // no storage at this slot, no information to pull out
+                        continue;
+                    };
+                    let store_id = storage.append_vec_id();
+
+                    scan_time.stop();
+                    scan_time_sum += scan_time.as_us();
+
+                    let insert_us = if pass == 0 {
+                        // generate index
+                        self.maybe_throttle_index_generation();
+                        let SlotIndexGenerationInfo {
+                            insert_time_us: insert_us,
+                            num_accounts: total_this_slot,
+                            num_accounts_rent_paying: rent_paying_this_slot,
+                            accounts_data_len: accounts_data_len_this_slot,
+                            amount_to_top_off_rent: amount_to_top_off_rent_this_slot,
+                            rent_paying_accounts_by_partition:
+                                rent_paying_accounts_by_partition_this_slot,
+                        } = self.generate_index_for_slot(
+                            &storage,
+                            *slot,
+                            store_id,
+                            &rent_collector,
+                            &storage_info,
+                        );
+
+                        rent_paying.fetch_add(rent_paying_this_slot, Ordering::Relaxed);
+                        amount_to_top_off_rent
+                            .fetch_add(amount_to_top_off_rent_this_slot, Ordering::Relaxed);
+                        total_including_duplicates.fetch_add(total_this_slot, Ordering::Relaxed);
+                        accounts_data_len.fetch_add(accounts_data_len_this_slot, Ordering::Relaxed);
+                        let mut rent_paying_accounts_by_partition =
+                            rent_paying_accounts_by_partition.lock().unwrap();
+                        rent_paying_accounts_by_partition_this_slot
+                            .iter()
+                            .for_each(|k| {
+                                rent_paying_accounts_by_partition.add_account(k);
+                            });
+
+                        insert_us
+                    } else {
+                        // verify index matches expected and measure the time to get all items
+                        assert!(verify);
+                        let mut lookup_time = Measure::start("lookup_time");
+                        for account_info in storage.accounts.account_iter() {
+                            let key = account_info.pubkey();
+                            let lock = self.accounts_index.get_bin(key);
+                            let x = lock.get(key).unwrap();
+                            let sl = x.slot_list.read().unwrap();
+                            let mut count = 0;
+                            for (slot2, account_info2) in sl.iter() {
+                                if slot2 == slot {
+                                    count += 1;
+                                    let ai = AccountInfo::new(
+                                        StorageLocation::AppendVec(store_id, account_info.offset()), // will never be cached
+                                        account_info.lamports(),
+                                    );
+                                    assert_eq!(&ai, account_info2);
+                                }
+                            }
+                            assert_eq!(1, count);
+                        }
+                        lookup_time.stop();
+                        lookup_time.as_us()
+                    };
+                    insertion_time_us.fetch_add(insert_us, Ordering::Relaxed);
+                }
+                scan_time_sum
+            })
+            .sum();
+        index_time.stop();
+
+        (scan_time, index_time.as_us())
+    }
+
+    pub fn generate_index_step2(
+        &self,
+        total_time: &mut Measure,
+        scan_time: u64,
+        index_time: u64,
+        insertion_time_us: Arc<AtomicU64>,
+        rent_collector: &RentCollector,
+        rent_paying: Arc<AtomicUsize>,
+        amount_to_top_off_rent: Arc<AtomicU64>,
+        total_including_duplicates: Arc<AtomicU64>,
+        accounts_data_len: Arc<AtomicU64>,
+        storage_info: StorageSizeAndCountMap,
+    ) -> u64 {
+        let mut slots = self.storage.all_slots();
+        slots.sort_unstable();
+     
+        let pass = 0;
+        info!("rent_collector: {:?}", rent_collector);
+        let (total_items, min_bin_size, max_bin_size) = self
+            .accounts_index
+            .account_maps
+            .iter()
+            .map(|map_bin| map_bin.len_for_stats())
+            .fold((0, usize::MAX, usize::MIN), |acc, len| {
+                (
+                    acc.0 + len,
+                    std::cmp::min(acc.1, len),
+                    std::cmp::max(acc.2, len),
+                )
+            });
+        let mut index_flush_us = 0;
+        let total_duplicate_slot_keys = AtomicU64::default();
+        let mut populate_duplicate_keys_us = 0;
+        // outer vec is accounts index bin (determined by pubkey value)
+        // inner vec is the pubkeys within that bin that are present in > 1 slot
+        let unique_pubkeys_by_bin = Mutex::new(Vec::<Vec<Pubkey>>::default());
+        if pass == 0 {
+            // tell accounts index we are done adding the initial accounts at startup
+            let mut m = Measure::start("accounts_index_idle_us");
+            self.accounts_index.set_startup(Startup::Normal);
+            m.stop();
+            index_flush_us = m.as_us();
+
+            populate_duplicate_keys_us = measure_us!({
+                // this has to happen before visit_duplicate_pubkeys_during_startup below
+                // get duplicate keys from acct idx. We have to wait until we've finished flushing.
+                self.accounts_index
+                    .populate_and_retrieve_duplicate_keys_from_startup(|slot_keys| {
+                        total_duplicate_slot_keys
+                            .fetch_add(slot_keys.len() as u64, Ordering::Relaxed);
+                        let unique_keys =
+                            HashSet::<Pubkey>::from_iter(slot_keys.iter().map(|(_, key)| *key));
+                        for (slot, key) in slot_keys {
+                            self.uncleaned_pubkeys.entry(slot).or_default().push(key);
+                        }
+                        let unique_pubkeys_by_bin_inner =
+                            unique_keys.into_iter().collect::<Vec<_>>();
+                        // does not matter that this is not ordered by slot
+                        unique_pubkeys_by_bin
+                            .lock()
+                            .unwrap()
+                            .push(unique_pubkeys_by_bin_inner);
+                    });
+            })
+            .1;
+        }
+        let unique_pubkeys_by_bin = unique_pubkeys_by_bin.into_inner().unwrap();
+
+        let mut timings = GenerateIndexTimings {
+            index_flush_us,
+            scan_time,
+            index_time: index_time,
+            insertion_time_us: insertion_time_us.load(Ordering::Relaxed),
+            min_bin_size,
+            max_bin_size,
+            total_items,
+            rent_paying: rent_paying.load(Ordering::Relaxed).into(),
+            amount_to_top_off_rent: amount_to_top_off_rent.load(Ordering::Relaxed).into(),
+            total_duplicate_slot_keys: total_duplicate_slot_keys.load(Ordering::Relaxed),
+            populate_duplicate_keys_us,
+            total_including_duplicates: total_including_duplicates.load(Ordering::Relaxed),
+            total_slots: slots.len() as u64,
+            ..GenerateIndexTimings::default()
+        };
+
+        if pass == 0 {
+            #[derive(Debug, Default)]
+            struct DuplicatePubkeysVisitedInfo {
+                accounts_data_len_from_duplicates: u64,
+                uncleaned_roots: IntSet<Slot>,
+            }
+            impl DuplicatePubkeysVisitedInfo {
+                fn reduce(mut a: Self, mut b: Self) -> Self {
+                    if a.uncleaned_roots.len() >= b.uncleaned_roots.len() {
+                        a.merge(b);
+                        a
+                    } else {
+                        b.merge(a);
+                        b
+                    }
+                }
+                fn merge(&mut self, other: Self) {
+                    self.accounts_data_len_from_duplicates +=
+                        other.accounts_data_len_from_duplicates;
+                    self.uncleaned_roots.extend(other.uncleaned_roots);
+                }
+            }
+
+            // subtract data.len() from accounts_data_len for all old accounts that are in the index twice
+            let mut accounts_data_len_dedup_timer =
+                Measure::start("handle accounts data len duplicates");
+            let DuplicatePubkeysVisitedInfo {
+                accounts_data_len_from_duplicates,
+                uncleaned_roots,
+            } = unique_pubkeys_by_bin
+                .par_iter()
+                .fold(
+                    DuplicatePubkeysVisitedInfo::default,
+                    |accum, pubkeys_by_bin| {
+                        let intermediate = pubkeys_by_bin
+                            .par_chunks(4096)
+                            .fold(DuplicatePubkeysVisitedInfo::default, |accum, pubkeys| {
+                                let (accounts_data_len_from_duplicates, uncleaned_roots) = self
+                                    .visit_duplicate_pubkeys_during_startup(
+                                        pubkeys,
+                                        &rent_collector,
+                                        &timings,
+                                    );
+                                let intermediate = DuplicatePubkeysVisitedInfo {
+                                    accounts_data_len_from_duplicates,
+                                    uncleaned_roots,
+                                };
+                                DuplicatePubkeysVisitedInfo::reduce(accum, intermediate)
+                            })
+                            .reduce(
+                                DuplicatePubkeysVisitedInfo::default,
+                                DuplicatePubkeysVisitedInfo::reduce,
+                            );
+                        DuplicatePubkeysVisitedInfo::reduce(accum, intermediate)
+                    },
+                )
+                .reduce(
+                    DuplicatePubkeysVisitedInfo::default,
+                    DuplicatePubkeysVisitedInfo::reduce,
+                );
+            accounts_data_len_dedup_timer.stop();
+            timings.accounts_data_len_dedup_time_us = accounts_data_len_dedup_timer.as_us();
+            timings.slots_to_clean = uncleaned_roots.len() as u64;
+
+            self.accounts_index
+                .add_uncleaned_roots(uncleaned_roots.into_iter());
+            accounts_data_len.fetch_sub(accounts_data_len_from_duplicates, Ordering::Relaxed);
+            info!(
+                "accounts data len: {}",
+                accounts_data_len.load(Ordering::Relaxed)
+            );
+        }
+        if pass == 0 {
+            // Need to add these last, otherwise older updates will be cleaned
+            for root in &slots {
+                self.accounts_index.add_root(*root);
+            }
+            self.set_storage_count_and_alive_bytes(storage_info, &mut timings);
+        }
+        total_time.stop();
+        timings.total_time_us = total_time.as_us();
+        timings.report(self.accounts_index.get_startup_stats());
+
+        self.accounts_index.log_secondary_indexes();
+        accounts_data_len.load(Ordering::Relaxed)
+    }
+
+    pub fn get_max_slot(&self) -> Slot {
+        self.storage.all_slots().last().cloned().unwrap_or_default()
     }
 
     pub fn generate_index(

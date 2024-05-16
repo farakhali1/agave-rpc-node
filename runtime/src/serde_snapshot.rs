@@ -18,11 +18,12 @@ use {
         accounts::Accounts,
         accounts_db::{
             AccountShrinkThreshold, AccountStorageEntry, AccountsDb, AccountsDbConfig, AppendVecId,
-            AtomicAppendVecId, BankHashStats, IndexGenerationInfo,
+            AtomicAppendVecId, BankHashStats, IndexGenerationInfo, StorageSizeAndCountMap,
         },
         accounts_file::AccountsFile,
         accounts_hash::AccountsHash,
         accounts_index::AccountSecondaryIndexes,
+        accounts_partition::RentPayingAccountsByPartition,
         accounts_update_notifier_interface::AccountsUpdateNotifier,
         blockhash_queue::BlockhashQueue,
         epoch_accounts_hash::EpochAccountsHash,
@@ -46,8 +47,8 @@ use {
         path::{Path, PathBuf},
         result::Result,
         sync::{
-            atomic::{AtomicBool, AtomicUsize, Ordering},
-            Arc,
+            atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+            Arc, Mutex,
         },
         thread::Builder,
     },
@@ -927,18 +928,63 @@ where
         })
         .unwrap();
 
-    let IndexGenerationInfo {
-        accounts_data_len,
-        rent_paying_accounts_by_partition,
-    } = accounts_db.generate_index(
+    // let IndexGenerationInfo {
+    //     accounts_data_len,
+    //     rent_paying_accounts_by_partition,
+    // } = accounts_db.generate_index(
+    //     limit_load_slot_count_from_snapshot,
+    //     verify_index,
+    //     genesis_config,
+    // );
+
+    let mut total_time = Measure::start("generate_index");
+    let rent_paying = Arc::new(AtomicUsize::new(0));
+    let amount_to_top_off_rent = Arc::new(AtomicU64::new(0));
+    let insertion_time_us = Arc::new(AtomicU64::new(0));
+    let max_slot = accounts_db.get_max_slot();
+    let schedule = &genesis_config.epoch_schedule;
+    let rent_collector: RentCollector = RentCollector::new(
+        schedule.get_epoch(max_slot),
+        schedule.clone(),
+        genesis_config.slots_per_year(),
+        genesis_config.rent.clone(),
+    );
+    let total_including_duplicates = Arc::new(AtomicU64::new(0));
+    let accounts_data_len = Arc::new(AtomicU64::new(0));
+    let storage_info = StorageSizeAndCountMap::default();
+    let rent_paying_accounts_by_partition =
+        Mutex::new(RentPayingAccountsByPartition::new(schedule));
+
+    let (scan_time, index_time) = accounts_db.generate_index_step1(
         limit_load_slot_count_from_snapshot,
         verify_index,
-        genesis_config,
+        rent_paying.clone(),
+        insertion_time_us.clone(),
+        amount_to_top_off_rent.clone(),
+        total_including_duplicates.clone(),
+        accounts_data_len.clone(),
+        &rent_collector,
+        &storage_info,
+        &rent_paying_accounts_by_partition,
     );
+
+    let accounts_data_len = accounts_db.generate_index_step2(
+        &mut total_time,
+        scan_time,
+        index_time,
+        insertion_time_us.clone(),
+        &rent_collector,
+        rent_paying.clone(),
+        amount_to_top_off_rent.clone(),
+        total_including_duplicates.clone(),
+        accounts_data_len.clone(),
+        storage_info,
+    );
+
     accounts_db
         .accounts_index
         .rent_paying_accounts_by_partition
-        .set(rent_paying_accounts_by_partition)
+        .set(rent_paying_accounts_by_partition.into_inner().unwrap())
         .unwrap();
 
     handle.join().unwrap();
