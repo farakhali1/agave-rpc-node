@@ -112,6 +112,11 @@ impl AccountStorage {
         self.map.extend(all_storages)
     }
 
+    pub fn extend_new(&mut self, all_storages: AccountStorageMap) {
+        assert!(self.no_shrink_in_progress());
+        self.map.extend(all_storages)
+    }
+
     /// remove the append vec at 'slot'
     /// returns the current contents
     pub(crate) fn remove(

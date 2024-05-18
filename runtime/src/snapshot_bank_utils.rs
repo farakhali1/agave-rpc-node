@@ -847,11 +847,11 @@ fn rebuild_bank_from_unarchived_snapshots(
     accounts_update_notifier: Option<AccountsUpdateNotifier>,
     exit: Arc<AtomicBool>,
 ) -> snapshot_utils::Result<Bank> {
-    let (full_snapshot_version, full_snapshot_root_paths) =
+    let (_full_snapshot_version, full_snapshot_root_paths) =
         verify_unpacked_snapshots_dir_and_version(
             full_snapshot_unpacked_snapshots_dir_and_version,
         )?;
-    let (incremental_snapshot_version, incremental_snapshot_root_paths) =
+    let (_incremental_snapshot_version, incremental_snapshot_root_paths) =
         if let Some(snapshot_unpacked_snapshots_dir_and_version) =
             incremental_snapshot_unpacked_snapshots_dir_and_version
         {
@@ -877,13 +877,13 @@ fn rebuild_bank_from_unarchived_snapshots(
     };
     info!("snapshot roots path {:?}", snapshot_root_paths);
 
-    let (full_snapshot_file_size, mut full_snapshot_data_file_stream) =
+    let (_full_snapshot_file_size, mut full_snapshot_data_file_stream) =
         snapshot_utils::create_snapshot_data_file_stream(
             &snapshot_root_paths.full_snapshot_root_file_path,
             snapshot_utils::MAX_SNAPSHOT_DATA_FILE_SIZE,
         )?;
 
-    let (incremental_snapshot_file_size, mut incremental_snapshot_data_file_stream) =
+    let (_incremental_snapshot_file_size, mut incremental_snapshot_data_file_stream) =
         if let Some(ref incremental_snapshot_root_file_path) =
             snapshot_root_paths.incremental_snapshot_root_file_path
         {
@@ -975,7 +975,7 @@ fn rebuild_bank_from_snapshot(
         full_snapshot_root_file_path: bank_snapshot.snapshot_path(),
         incremental_snapshot_root_file_path: None,
     };
-    let bank_snapshot_dir = PathBuf::from(("/mnt/ledger/snap-shots"));
+    let bank_snapshot_dir = PathBuf::from("/mnt/ledger/snap-shots");
     let bank = deserialize_snapshot_data_files(&snapshot_root_paths, |snapshot_streams| {
         Ok(bank_from_streams(
             None,
