@@ -95,6 +95,13 @@ impl AccountStorage {
         self.map.iter().map(|iter_item| *iter_item.key()).collect()
     }
 
+    pub(crate) fn selected_slots(&self, threshold: Slot) -> Vec<Slot> {
+        assert!(self.no_shrink_in_progress());
+        let mut res: Vec<Slot> = self.map.iter().map(|iter_item| *iter_item.key()).collect();
+        res.retain(|&x| x >= threshold);
+        res
+    }
+
     /// returns true if there is no entry for 'slot'
     #[cfg(test)]
     pub(crate) fn is_empty_entry(&self, slot: Slot) -> bool {

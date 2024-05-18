@@ -634,7 +634,7 @@ where
         capitalizations,
         bank_fields.incremental_snapshot_persistence.as_ref(),
     )?;
-
+    info!("Reached Here");
     let bank_rc = BankRc::new(Accounts::new(Arc::new(accounts_db)), bank_fields.slot);
     let runtime_config = Arc::new(runtime_config.clone());
 
@@ -936,14 +936,14 @@ where
 
     let mut measure_notify = Measure::start("accounts_notify");
 
-    let mut accounts_db = Arc::new(accounts_db);
-    let accounts_db_clone = accounts_db.clone();
-    let handle = Builder::new()
-        .name("solNfyAccRestor".to_string())
-        .spawn(move || {
-            accounts_db_clone.notify_account_restore_from_snapshot();
-        })
-        .unwrap();
+    // let mut accounts_db = Arc::new(accounts_db);
+    // let accounts_db_clone = accounts_db.clone();
+    // let handle = Builder::new()
+    //     .name("solNfyAccRestor".to_string())
+    //     .spawn(move || {
+    //         accounts_db_clone.notify_account_restore_from_snapshot();
+    //     })
+    //     .unwrap();
 
     // let IndexGenerationInfo {
     //     accounts_data_len,
@@ -996,14 +996,28 @@ where
             incremental_snapshot_archive_info.as_ref(),
             account_paths,
             next_append_vec_id_new.clone(),
-        )
-        .unwrap();
+        ).unwrap();
+
+
+        info!("Max slot {:?}",max_slot);
+        info!("Slots {:?}",unarchived_incremental_snapshot
+        .as_ref()
+        .unwrap()
+        .storage);
+        
+  let sllot = accounts_db.get_max_sllot();
     unarchived_incremental_snapshot
         .as_ref()
         .unwrap()
         .storage
-        .retain(|&key, _| key > max_slot);
+        .retain(|&key, _| key > sllot);
 
+
+        info!("Max slot {:?}",sllot);
+        info!("Slots {:?}",unarchived_incremental_snapshot
+        .as_ref()
+        .unwrap()
+        .storage);
     let incremental_snapshot_unpacked_snapshots_dir_and_version = unarchived_incremental_snapshot
         .as_ref()
         .map(|unarchive_preparation_result| {
@@ -1055,7 +1069,11 @@ where
             .map(|bank_fields| bank_fields.capitalization),
     );
     let bank_fields_new = bank_fields_new.collapse_into();
-
+    if let Some(epoch_accounts_hash) = bank_fields_new.epoch_accounts_hash {
+        accounts_db
+            .epoch_accounts_hash_manager
+            .set_valid(EpochAccountsHash::new(epoch_accounts_hash), 0);
+    }
     // Store the accounts hash & capitalization, from the full snapshot, in the new AccountsDb
     {
         let AccountsDbFields(_, _, slot, bank_hash_info, _, _) =
@@ -1063,13 +1081,11 @@ where
 
         // Otherwise, we've booted from a snapshot archive, or from local state that was *not*
         // intended to be an incremental snapshot.
-        let old_accounts_hash = Arc::try_unwrap(accounts_db.clone())
-            .unwrap()
-            .set_accounts_hash_from_snapshot(
-                *slot,
-                bank_hash_info.accounts_hash.clone(),
-                capitalizations.0,
-            );
+        let old_accounts_hash = accounts_db.set_accounts_hash_from_snapshot(
+            *slot,
+            bank_hash_info.accounts_hash.clone(),
+            capitalizations_new.0,
+        );
         assert!(
             old_accounts_hash.is_none(),
             "There should not already be an AccountsHash at slot {slot}: {old_accounts_hash:?}",
@@ -1107,27 +1123,21 @@ where
     );
 
     // Process deserialized data, set necessary fields in self
-    let old_accounts_delta_hash = Arc::try_unwrap(accounts_db.clone())
-        .unwrap()
-        .set_accounts_delta_hash_from_snapshot(
-            snapshot_slot,
-            snapshot_bank_hash_info.accounts_delta_hash,
-        );
+    let old_accounts_delta_hash = accounts_db.set_accounts_delta_hash_from_snapshot(
+        snapshot_slot,
+        snapshot_bank_hash_info.accounts_delta_hash,
+    );
     assert!(
         old_accounts_delta_hash.is_none(),
         "There should not already be an AccountsDeltaHash at slot {snapshot_slot}: {old_accounts_delta_hash:?}",
         );
-    let old_stats = Arc::try_unwrap(accounts_db.clone())
-        .unwrap()
+    let old_stats = accounts_db
         .update_bank_hash_stats_from_snapshot(snapshot_slot, snapshot_bank_hash_info.stats);
     assert!(
         old_stats.is_none(),
         "There should not already be a BankHashStats at slot {snapshot_slot}: {old_stats:?}",
     );
-    Arc::try_unwrap(accounts_db.clone())
-        .unwrap()
-        .storage
-        .extend_new((storage.clone()).into());
+    accounts_db.storage.extend_new((storage.clone()).into());
     accounts_db
         .next_id
         .store(next_append_vec_id, Ordering::Release);
@@ -1136,7 +1146,7 @@ where
         .fetch_add(snapshot_version, Ordering::Release);
 
     let (scan_time, index_time) = accounts_db.generate_index_step1(
-        limit_load_slot_count_from_snapshot,
+        Some(sllot.try_into().unwrap()),
         verify_index,
         rent_paying.clone(),
         insertion_time_us.clone(),
@@ -1167,7 +1177,7 @@ where
         .set(rent_paying_accounts_by_partition.into_inner().unwrap())
         .unwrap();
 
-    handle.join().unwrap();
+    // handle.join().unwrap();
     measure_notify.stop();
 
     datapoint_info!(
@@ -1176,7 +1186,7 @@ where
     );
     info!("Generate Index Function Completed");
     Ok((
-        Arc::try_unwrap(accounts_db).unwrap(),
+        accounts_db,
         ReconstructedAccountsDbInfo { accounts_data_len },
     ))
 }

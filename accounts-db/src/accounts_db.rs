@@ -8987,21 +8987,25 @@ impl AccountsDb {
         storage_info: &StorageSizeAndCountMap,
         rent_paying_accounts_by_partition: &Mutex<RentPayingAccountsByPartition>,
     ) -> (u64, u64) {
-        let mut slots = self.storage.all_slots();
+        let mut slots: Vec<Slot>;
+        if let Some(limit) = limit_load_slot_count_from_snapshot {
+            slots = self.storage.selected_slots(limit as u64);
+        } else {
+            slots = self.storage.all_slots();
+        }
+
         slots.sort_unstable();
         info!("Slots len: {:?}", slots.len());
         // info!("Slots: {:?}", slots);
         info!("slots first {:?}", slots.first());
         info!("slots last {:?}", slots.last());
-        if let Some(limit) = limit_load_slot_count_from_snapshot {
-            slots.truncate(limit); // get rid of the newer slots and keep just the older
-        }
-
         let pass = 0;
+        if !limit_load_slot_count_from_snapshot.is_some()
+        {
         if pass == 0 {
             self.accounts_index
                 .set_startup(Startup::StartupWithExtraThreads);
-        }
+        }}
 
         let total_processed_slots_across_all_threads = AtomicU64::new(0);
         let outer_slots_len = slots.len();
@@ -9014,7 +9018,7 @@ impl AccountsDb {
         };
         let chunk_size = (outer_slots_len / (std::cmp::max(1, threads.saturating_sub(1)))) + 1; // approximately 400k slots in a snapshot
         let mut index_time = Measure::start("index");
-        info!("threads {:?}, chunks {:?}", threads, chunk_size);
+        // info!("threads {:?}, chunks {:?}", threads, chunk_size);
 
         let scan_time: u64 = slots
             .par_chunks(chunk_size)
@@ -9025,10 +9029,10 @@ impl AccountsDb {
                     outer_slots_len as u64,
                 );
                 let mut scan_time_sum = 0;
-                info!("slots - > {:?}", slots);
-                info!("chunk_size - > {:?}", chunk_size);
+                // info!("slots - > {:?}", slots);
+                // info!("chunk_size - > {:?}", chunk_size);
                 for (index, slot) in slots.iter().enumerate() {
-                    info!("index {:?}, slot {:?}", index, slot);
+                    // info!("index {:?}, slot {:?}", index, slot);
                     let mut scan_time = Measure::start("scan");
                     log_status.report(index as u64);
                     let Some(storage) = self.storage.get_slot_storage_entry(*slot) else {
@@ -9104,7 +9108,7 @@ impl AccountsDb {
             })
             .sum();
         index_time.stop();
-
+info!("second iter completed");
         (scan_time, index_time.as_us())
     }
 
@@ -9123,7 +9127,10 @@ impl AccountsDb {
     ) -> u64 {
         let mut slots = self.storage.all_slots();
         slots.sort_unstable();
-     
+        info!("Slots len: {:?}", slots.len());
+        // info!("Slots: {:?}", slots);
+        info!("slots first {:?}", slots.first());
+        info!("slots last {:?}", slots.last());
         let pass = 0;
         info!("rent_collector: {:?}", rent_collector);
         let (total_items, min_bin_size, max_bin_size) = self
@@ -9145,8 +9152,10 @@ impl AccountsDb {
         // inner vec is the pubkeys within that bin that are present in > 1 slot
         let unique_pubkeys_by_bin = Mutex::new(Vec::<Vec<Pubkey>>::default());
         if pass == 0 {
+            info!("reached here A");
             // tell accounts index we are done adding the initial accounts at startup
             let mut m = Measure::start("accounts_index_idle_us");
+          
             self.accounts_index.set_startup(Startup::Normal);
             m.stop();
             index_flush_us = m.as_us();
@@ -9161,6 +9170,7 @@ impl AccountsDb {
                         let unique_keys =
                             HashSet::<Pubkey>::from_iter(slot_keys.iter().map(|(_, key)| *key));
                         for (slot, key) in slot_keys {
+                            info!("reached here {:?}",slot);
                             self.uncleaned_pubkeys.entry(slot).or_default().push(key);
                         }
                         let unique_pubkeys_by_bin_inner =
@@ -9175,7 +9185,7 @@ impl AccountsDb {
             .1;
         }
         let unique_pubkeys_by_bin = unique_pubkeys_by_bin.into_inner().unwrap();
-
+info!("reached here");
         let mut timings = GenerateIndexTimings {
             index_flush_us,
             scan_time,
@@ -9192,7 +9202,7 @@ impl AccountsDb {
             total_slots: slots.len() as u64,
             ..GenerateIndexTimings::default()
         };
-
+        info!("reached here 2");
         if pass == 0 {
             #[derive(Debug, Default)]
             struct DuplicatePubkeysVisitedInfo {
@@ -9265,6 +9275,7 @@ impl AccountsDb {
                 accounts_data_len.load(Ordering::Relaxed)
             );
         }
+        info!("reached here 3");
         if pass == 0 {
             // Need to add these last, otherwise older updates will be cleaned
             for root in &slots {
@@ -9282,6 +9293,12 @@ impl AccountsDb {
 
     pub fn get_max_slot(&self) -> Slot {
         self.storage.all_slots().last().cloned().unwrap_or_default()
+    }
+
+    pub fn get_max_sllot(&self) -> Slot {
+        let mut slot = self.storage.all_slots();
+        slot.sort_unstable();
+        slot.last().cloned().unwrap_or_default()
     }
 
     pub fn generate_index(
